@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   macos:
-    runs-on: macos-14
+    runs-on: macos-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -25,4 +25,3 @@ jobs:
         run: python3 -B -m unittest discover -s backend -p 'test_*.py'
       - name: Build, test Swift models and verify local signature
         run: bash build-app.sh
-
