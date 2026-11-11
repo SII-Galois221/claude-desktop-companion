@@ -49,6 +49,8 @@ All Companion history data stays under:
 
 Directories created by the history service use mode `700`; private files use mode `600`. Backups are **not encrypted by this app**. They include conversation text and may include secrets that were present in those conversations. Keep this entire directory private; do not commit it or attach it to GitHub issues. Copies made by OS backup or cloud-sync software follow that software’s settings.
 
+Across all registered accounts, only the two newest verified complete checkpoints are kept in total. Older checkpoints are removed only after a successful backup or completed import. A failed operation does not rotate existing backups.
+
 Backups contain metadata and local transcript files, not your project source tree, login credentials, or scheduled-task configuration. A prior target snapshot with missing transcript bodies is retained for inspection but is not offered as a complete import source.
 
 The history service makes no network requests. Network monitoring, if explicitly configured, is a separate feature.

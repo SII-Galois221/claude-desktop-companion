@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
 import sys
 import tempfile
@@ -32,6 +33,7 @@ HISTORY_KEYS = (
 )
 READ_ERRORS = (RuntimeError, OSError, ValueError, KeyError, TypeError)
 PREVIEW_LIFETIME = 30 * 60
+BACKUP_LIMIT = 2
 BACKUP_NAME = re.compile(r'\d{8}T\d{6}\.\d{6}Z-[0-9a-f]{8}\Z')
 
 
@@ -364,7 +366,7 @@ class HistoryService:
             elif record['isArchived'] or record['sessionId'] in archived or (existing and existing['isArchived']):
                 kind, reason = 'archived', '任一侧已归档，已排除。'
             elif existing and history_signature(existing) == signature:
-                kind, reason = 'unchanged', '已有入口引用相同历史；标题、权限等保持各账号现状。'
+                kind, reason = 'unchanged', '现有入口引用同一份本地正文，无需重复新增入口；正文是否需要补回见预览汇总。'
             elif existing:
                 destination = (self.saved_copy_name(source, target, record) if saved
                                else engine.copy_name(self.env, source, target, record))
@@ -631,6 +633,45 @@ class HistoryService:
                         continue
         return sorted(result, key=lambda item: item['created_at'], reverse=True)
 
+    def prune_backups(self):
+        """Keep the two newest verified checkpoints across all registered accounts.
+
+        Called after an entire backup/import succeeds, never from checkpoint():
+        a same-account restore may still be reading the oldest checkpoint.
+        Unfinished or damaged folders are left for explicit inspection.
+        """
+        result = {'removed': [], 'warnings': []}
+        accounts = self.env.settings()['accounts']
+        verified = []
+        for alias in sorted(accounts):
+            try:
+                base = engine.safe(self.root / 'backups' / alias)
+                folders = list(engine.safe(base, 'dir').iterdir()) if base.exists() else []
+            except READ_ERRORS as exc:
+                result['warnings'].append(f'{alias}：未清理旧备份：{exc}')
+                continue
+            for folder in folders:
+                if not BACKUP_NAME.fullmatch(folder.name):
+                    continue
+                backup_id = alias + '/' + folder.name
+                try:
+                    backup = self.read_backup(backup_id)
+                    meta = backup['root'].stat()
+                    verified.append((backup['metadata']['created_at'], backup_id,
+                                     backup['root'], (meta.st_dev, meta.st_ino)))
+                except READ_ERRORS as exc:
+                    result['warnings'].append(f'{backup_id}：保留无法完整校验的备份：{exc}')
+        for _, backup_id, folder, identity in sorted(verified, reverse=True)[BACKUP_LIMIT:]:
+            try:
+                meta = engine.safe(folder, 'dir').stat()
+                engine.require((meta.st_dev, meta.st_ino) == identity, '备份目录在清理前发生变化。')
+                shutil.rmtree(folder)
+                result['removed'].append(backup_id)
+            except READ_ERRORS as exc:
+                result['warnings'].append(f'{backup_id}：未清理旧备份：{exc}')
+        return result
+
+
     def destination_state(self, path, directory=False):
         engine.safe(path)
         if not path.exists():
@@ -748,6 +789,9 @@ class HistoryService:
                 **{kind + '_count': counts[kind] for kind in ('missing', 'continuation', 'unchanged', 'equivalent', 'conflict')},
                 'skipped_count': counts['archived'] + counts['deleted'],
                 'detail': ('当前内容与备份存在冲突，未执行导入。' if counts['conflict'] else
+                           f"无需重复导入：现有入口共用的本地正文已包含本次备份内容，保留 {plan['retained_newer_count']} 个较新文件。请在 Claude 打开原会话；标题和列表时间保持当前账号现状。"
+                           if not plan['can_sync'] and plan['bodies'] else
+                           '没有需要导入的入口或文件；已归档或已删除的记录保持现状。' if not plan['can_sync'] else
                            f"将新增 {len(plan['prepared'])} 个入口、恢复 {plan['restore_files_count']} 个文件；保留 {plan['retained_newer_count']} 个较新文件。")}
 
     def verify_saved_target(self, plan, expected_directory, expected_bodies, expected_dirs):
@@ -894,20 +938,32 @@ class HistoryService:
         engine.require(not ('source' in request and 'backup_id' in request), '不能同时选择实时账号和保存的备份。')
         if command == 'status':
             return self.status()
-        engine.require(command in ('backup', 'preview', 'sync'), '未知历史操作。')
+        engine.require(command in ('backup', 'preview', 'sync', 'prune_backups'), '未知历史操作。')
         with self.operation():
+            if command == 'prune_backups':
+                engine.require(not request, '清理备份不接受额外参数。')
+                retention = self.prune_backups()
+                return {'ok': True, 'retention': retention, 'detail': '已按所有账号合计最近两份完整备份整理。'}
             if 'backup_id' in request:
                 engine.require(command in ('preview', 'sync'), '备份操作只能针对当前账号。')
-                return self.preview_saved(request) if command == 'preview' else self.sync_saved(request)
-            return getattr(self, command)(request)
+                result = self.preview_saved(request) if command == 'preview' else self.sync_saved(request)
+            else:
+                result = getattr(self, command)(request)
+            if command in ('backup', 'sync') and result.get('ok'):
+                # Cleanup must not turn a completed backup/import into a failure.
+                try:
+                    result['retention'] = self.prune_backups()
+                except READ_ERRORS as exc:
+                    result['retention'] = {'removed': [], 'warnings': [f'未清理旧备份：{exc}']}
+            return result
 
 
 def main(argv=None, service=None):
     os.umask(0o077)
     args = sys.argv[1:] if argv is None else argv
     try:
-        engine.require(len(args) == 1 and args[0] in ('status', 'register', 'backup', 'preview', 'sync'),
-                       '用法：history_service.py status|register|backup|preview|sync')
+        engine.require(len(args) == 1 and args[0] in ('status', 'register', 'backup', 'preview', 'sync', 'prune_backups'),
+                       '用法：history_service.py status|register|backup|preview|sync|prune_backups')
         command = args[0]
         request = {}
         if command != 'status':

@@ -196,6 +196,8 @@ class HistoryServiceTests(unittest.TestCase):
             self.service.execute('register', {'alias': 'primary'})
         self.assertFalse(self.accounts.exists())
 
+
+
     def test_status_is_read_only_and_has_three_accounts(self):
         self.add()
         result = self.service.execute('status')
@@ -894,6 +896,115 @@ class SavedBackupTests(unittest.TestCase):
         manifest['summary'].pop('backup_id')
         engine.private_json(path, manifest, replace=True)
         self.assertTrue(self.saved_preview()['can_sync'])
+
+
+class BackupRetentionTests(unittest.TestCase):
+    setUp = HistoryServiceTests.setUp
+    tearDown = HistoryServiceTests.tearDown
+    set_active = HistoryServiceTests.set_active
+    put_transcript = HistoryServiceTests.put_transcript
+    add = HistoryServiceTests.add
+    write = HistoryServiceTests.write
+    record = HistoryServiceTests.record
+
+    def test_third_account_backup_removes_global_oldest_but_preserves_live_history(self):
+        backups = []
+        for number, alias in enumerate(('personal', 'work', 'research'), 100):
+            self.add(alias, number=number)
+            self.set_active(alias)
+            backups.append(self.service.execute('backup'))
+        first, second, third = backups
+        self.assertEqual(third['retention']['removed'], [first['backup_id']])
+        self.assertEqual(third['retention']['warnings'], [])
+        self.assertFalse(Path(first['path']).exists())
+        for item in (second, third):
+            self.assertTrue(Path(item['path']).is_dir())
+        self.assertEqual(len(self.service.list_backups()), 2)
+        for number, alias in enumerate(('personal', 'work', 'research'), 100):
+            self.assertTrue((self.env.folder(alias) / ('local_' + uid(number) + '.json')).exists())
+            self.assertTrue((self.projects / 'project' / (uid(number) + '.jsonl')).exists())
+
+    def test_global_rotation_keeps_two_newest_even_when_both_belong_to_same_account(self):
+        self.add('work')
+        self.add('research', number=200)
+        first = self.service.checkpoint('work', self.service.identity())
+        second = self.service.execute('backup')
+        third = self.service.execute('backup')
+        self.assertEqual(third['retention']['removed'], [first['backup_id']])
+        self.assertEqual({item['backup_id'] for item in self.service.list_backups()},
+                         {second['backup_id'], third['backup_id']})
+
+    def test_failed_backup_keeps_both_previous_backups(self):
+        self.add('research')
+        previous = [self.service.execute('backup') for _ in range(2)]
+        with patch.object(engine, 'backup_files', side_effect=OSError('synthetic copy failure')):
+            with self.assertRaises(OSError):
+                self.service.execute('backup')
+        self.assertTrue(all(Path(item['path']).is_dir() for item in previous))
+
+    def test_failed_import_does_not_rotate_checkpoints(self):
+        self.add('work')
+        previous = [self.service.execute('backup') for _ in range(2)]
+        preview = self.service.execute('preview', self.request)
+        with patch.object(engine, 'apply_history', side_effect=RuntimeError('synthetic import failure')):
+            result = self.service.execute('sync', {**self.request, 'preview_id': preview['preview_id']})
+        self.assertFalse(result['ok'])
+        self.assertTrue(all(Path(item['path']).is_dir() for item in previous))
+        self.assertEqual(len(list((self.root / 'backups/research').iterdir())), 3)
+
+    def test_same_account_import_keeps_source_until_success_then_rotates(self):
+        name = self.add('research')
+        first = self.service.execute('backup')
+        second = self.service.execute('backup')
+        (self.env.folder('research') / name).unlink()
+        request = {'backup_id': first['backup_id'], 'target': 'research'}
+        preview = self.service.execute('preview', request)
+        original = self.service.append_file
+        def assert_source_still_exists(*args, **kwargs):
+            self.assertTrue(Path(first['path']).is_dir())
+            self.assertEqual(len(list((self.root / 'backups/research').iterdir())), 3)
+            return original(*args, **kwargs)
+        with patch.object(self.service, 'append_file', side_effect=assert_source_still_exists):
+            result = self.service.execute('sync', {**request, 'preview_id': preview['preview_id']})
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(result['retention']['removed'], [first['backup_id']])
+        self.assertFalse(Path(first['path']).exists())
+        self.assertTrue(Path(second['path']).is_dir())
+        self.assertTrue((self.env.folder('research') / name).is_file())
+
+    def test_explicit_prune_ignores_unfinished_unknown_and_symlink_folders(self):
+        self.add('research')
+        previous = [self.service.checkpoint(alias, self.service.identity())
+                    for alias in ('personal', 'work', 'research')]
+        folder = self.root / 'backups/research'
+        unfinished = folder / '20000101T000000.000000Z-aaaaaaaa'
+        unfinished.mkdir(mode=0o700)
+        outside = self.base / 'outside'
+        outside.mkdir()
+        (outside / 'keep.txt').write_text('keep')
+        link = folder / '20000101T000000.000001Z-bbbbbbbb'
+        link.symlink_to(outside, target_is_directory=True)
+        unknown = self.root / 'backups/unregistered'
+        unknown.mkdir()
+        result = self.service.execute('prune_backups')
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['retention']['removed'], [previous[0]['backup_id']])
+        self.assertEqual(len(result['retention']['warnings']), 2)
+        self.assertTrue(unfinished.is_dir())
+        self.assertTrue(link.is_symlink())
+        self.assertTrue((outside / 'keep.txt').is_file())
+        self.assertTrue(unknown.is_dir())
+
+    def test_cleanup_failure_does_not_report_successful_backup_as_failed(self):
+        self.add('research')
+        previous = [self.service.execute('backup') for _ in range(2)]
+        with patch.object(service.shutil, 'rmtree', side_effect=OSError('synthetic cleanup failure')):
+            result = self.service.execute('backup')
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['retention']['removed'], [])
+        self.assertIn('synthetic cleanup failure', result['retention']['warnings'][0])
+        self.assertTrue(all(Path(item['path']).is_dir() for item in previous))
+
 
 
 if __name__ == '__main__':

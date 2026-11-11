@@ -279,6 +279,7 @@ final class HistoryWindowController: NSObject, NSWindowDelegate, NSMenuDelegate,
         progress.isDisplayedWhenStopped = false
         let actions = NSStackView(views: [backupButton, refreshButton, revealBackupButton, progress]); actions.spacing = 10
         stack.addArrangedSubview(actions)
+        stack.addArrangedSubview(label("所有账号合计最多保留最近 2 份备份；新备份成功后自动清理旧份。", size: 11, secondary: true))
         let separator = NSBox(); separator.boxType = .separator; stack.addArrangedSubview(separator)
 
         stack.addArrangedSubview(label("将备份导入当前账号", size: 14, weight: .semibold))
@@ -408,7 +409,7 @@ final class HistoryWindowController: NSObject, NSWindowDelegate, NSMenuDelegate,
         accountsSummary.toolTip = accountsSummary.stringValue
         targetLabel.stringValue = "导入到：\(activeAlias ?? "尚未识别")"
         if let preview = preview {
-            summaryLabel.stringValue = "新增 \(preview.missing + preview.continuation) 条（备份副本 \(preview.continuation)） · 补回 \(preview.restoreFiles) 个文件 · 保留 \(preview.retainedNewer) 个较新文件\n已有 \(preview.unchanged) · 相同 \(preview.equivalent) · 跳过 \(preview.skipped) · 冲突 \(preview.conflicts)"
+            summaryLabel.stringValue = "新增 \(preview.missing + preview.continuation) 条（备份副本 \(preview.continuation)） · 补回 \(preview.restoreFiles) 个文件 · 保留 \(preview.retainedNewer) 个较新文件\n现有入口 \(preview.unchanged) · 相同 \(preview.equivalent) · 跳过 \(preview.skipped) · 冲突 \(preview.conflicts)"
             summaryLabel.textColor = preview.conflicts > 0 ? .systemRed : .labelColor
         } else {
             summaryLabel.stringValue = savedBackups.isEmpty ?
@@ -459,7 +460,9 @@ final class HistoryWindowController: NSObject, NSWindowDelegate, NSMenuDelegate,
                 let records = result["records"] as? Int ?? 0
                 let bytes = (result["bytes"] as? NSNumber)?.int64Value ?? 0
                 let size = ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
-                self.setMessage("已备份 \(source)：\(records) 条记录，\(size)。备份已保存，可在下方选择并导入。")
+                let warnings = (result["retention"] as? [String: Any])?["warnings"] as? [String] ?? []
+                let detail = warnings.isEmpty ? "所有账号合计最多保留最近 2 份备份。" : warnings.joined(separator: "；")
+                self.setMessage("已备份 \(source)：\(records) 条记录，\(size)。" + detail, error: !warnings.isEmpty)
             } else { self.setMessage(result["detail"] as? String ?? "备份未完成，请检查后重试。", error: true) }
             self.refreshStatus()
         }
@@ -563,7 +566,8 @@ final class HistoryWindowController: NSObject, NSWindowDelegate, NSMenuDelegate,
                         self.lastBackupPath = result["backup_path"] as? String ?? self.lastBackupPath
                         let added = result["added"] as? Int ?? 0
                         let restored = result["restored_files"] as? Int ?? 0
-                        let message = "已导入 \(added) 条记录、补回 \(restored) 个文件到 \(preview.target)。Claude 已重新打开，请在 Code 列表查看。"
+                        let warnings = (result["retention"] as? [String: Any])?["warnings"] as? [String] ?? []
+                        let message = "已导入 \(added) 条记录、补回 \(restored) 个文件到 \(preview.target)。Claude 已重新打开，请在 Code 列表查看。" + warnings.joined(separator: "；")
                         self.setActivity(.reopening)
                         self.setMessage("导入完成：新增 \(added) 条记录、补回 \(restored) 个文件。正在重新打开 Claude…")
                         self.openClaude(successMessage: message) { [weak self] in
